@@ -51,7 +51,7 @@ class WebSessionConverter:
             }
         ]
 
-        # Common + Capella-specific endpoints based on research
+        # Common + specific endpoints based on research
         auth_endpoints = [
             '/api/auth/aws',
             '/api/auth/session',
