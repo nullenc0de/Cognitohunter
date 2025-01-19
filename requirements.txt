@@ -1,0 +1,23 @@
+# Core dependencies
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+boto3>=1.34.0
+python-jwt>=4.0.0
+
+# AWS SDK dependencies
+botocore>=1.34.0
+
+# JWT and Crypto
+pyjwt>=2.8.0
+cryptography>=41.0.0
+
+# XML processing
+lxml>=4.9.0
+
+# HTTP and SSL
+urllib3>=2.0.0
+certifi>=2023.11.17
+
+# Utility
+python-dateutil>=2.8.2
+six>=1.16.0
